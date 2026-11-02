@@ -2,7 +2,7 @@
   'use strict';
 
   const SYNC_INTERVAL_MS = 20 * 1000;   // как часто сверяться с сервером
-  const RENDER_DELAY_MS = 100;          // пауза, чтобы пачку изменений отрисовать один раз
+  const RENDER_DELAY_MS = 50;           // пауза для отложенных изменений (фоновые обновления)
   const MAX_IDS_PER_REQUEST = 200;      // ограничение REST API на число id в одном запросе
 
   const CHECKLIST_ROW = '.work-item-list-container .work-item';
@@ -10,6 +10,9 @@
   const AVATAR_CLASS = 'cc-avatar';
   const ROW_WITH_AVATAR_CLASS = 'cc-has-avatar';
   const TOOLTIP_ASSIGNEE_CLASS = 'cc-tooltip-assignee';
+
+  const BADGE_AVATARS_CLASS = 'cc-badge-avatars';
+  const BADGE_AVATAR_CLASS = 'cc-badge-avatar';
 
   /** id задачи -> исполнитель с сервера. Заполняется, только когда модели доверять нельзя. */
   const serverAssignees = new Map();
@@ -28,20 +31,31 @@
   render();
 
   /**
-   * Аватар стоит в строке между иконкой типа задачи и заголовком.
-   * Заголовок сужается на ширину аватара с отступами: у TFS он calc(100% - 67px), аватар занимает ещё 24px.
+   * Стили аватарок в раскрытом чеклисте и в бейджах свернутых карточек.
+   * Заголовок сужается на ширину аватара с отступами: у TFS он calc(100% - 67px), аватар занимает ещё 26px.
    */
   function addStyles() {
     const style = document.createElement('style');
     style.textContent = `
       ${CHECKLIST_ROW} .${AVATAR_CLASS} {
-        display: inline-block; vertical-align: top; margin: 1px 4px 0 2px;
-        width: 18px; height: 18px; border-radius: 50%;
+        display: inline-block; vertical-align: top; margin: 0 4px 0 -4px;
+        width: 20px; height: 20px; border-radius: 50%;
       }
       ${CHECKLIST_ROW}.${ROW_WITH_AVATAR_CLASS} ${ROW_TITLE} {
-        max-width: calc(100% - 91px);
+        max-width: calc(100% - 93px);
       }
       .${TOOLTIP_ASSIGNEE_CLASS} { opacity: .75; margin-top: 2px; }
+
+      .${BADGE_AVATARS_CLASS} {
+        display: inline-flex; align-items: center; margin-left: -4px; margin-top: -8px; gap: 3px;
+      }
+      .${BADGE_AVATAR_CLASS} {
+        width: 20px; height: 20px; border-radius: 50%; object-fit: cover;
+        flex-shrink: 0; display: inline-block; vertical-align: middle;
+      }
+      .child-work-items-summary[aria-expanded="true"] ~ .${BADGE_AVATARS_CLASS} {
+        display: none;
+      }
     `;
     document.head.appendChild(style);
   }
@@ -51,10 +65,30 @@
    * и перерисовывает аватары. Изменения, которые вносит сам скрипт, пропускаются.
    */
   function observeBoard() {
+    const isOwnNode = node => node.classList?.contains(AVATAR_CLASS)
+      || node.classList?.contains(BADGE_AVATARS_CLASS)
+      || node.classList?.contains(BADGE_AVATAR_CLASS);
+
+    const isChecklistNode = node => node.nodeType === 1 && (
+      node.matches?.('.work-item') ||
+      node.querySelector?.('.work-item') ||
+      node.classList?.contains('work-item-list-container')
+    );
+
     new MutationObserver(mutations => {
       const onlyOwnChanges = mutations.every(m =>
-        [...m.addedNodes, ...m.removedNodes].every(node => node.classList?.contains(AVATAR_CLASS)));
-      if (!onlyOwnChanges) scheduleRender();
+        [...m.addedNodes, ...m.removedNodes].every(isOwnNode));
+      if (onlyOwnChanges) return;
+
+      const hasChecklistRows = mutations.some(m =>
+        [...m.addedNodes].some(isChecklistNode));
+
+      if (hasChecklistRows) {
+        // Отрисовываем сразу синхронно в микротаске до первого paint браузера,
+        // чтобы аватар уже стоял в DOM и текст строки не скакал при раскрытии.
+        render();
+      }
+      scheduleRender();
     }).observe(document.body, { childList: true, subtree: true });
   }
 
@@ -64,22 +98,53 @@
     renderTimer = setTimeout(render, RENDER_DELAY_MS);
   }
 
-  /** Обновляет аватары у всех строк раскрытых чеклистов. */
+  /** Обновляет аватары у всех строк раскрытых чеклистов и у свернутых бейджей карточек. */
   function render() {
     extendRowTooltip();
+    const incompleteIds = [
+      ...renderChecklistRows(),
+      ...renderChecklistBadges(),
+    ];
+    if (incompleteIds.length) syncWithServer(incompleteIds);
+  }
+
+  /** Отрисовывает аватары в строках раскрытых чеклистов. Возвращает id задач с неполными моделями. */
+  function renderChecklistRows() {
     const incompleteIds = [];
     for (const { row, task } of checklistRows()) {
       watchTaskChanges(task);
-      const id = task.id();
       const assignee = currentAssignee(task);
       if (assignee && !avatarUrl(assignee)) {
-        // Модель неполная: прежний аватар не трогаем, данные берём с сервера.
-        incompleteIds.push(id);
+        incompleteIds.push(task.id());
       } else {
         showAvatar(row, assignee);
       }
     }
-    if (incompleteIds.length) syncWithServer(incompleteIds);
+    return incompleteIds;
+  }
+
+  /** Отрисовывает аватары у свернутых бейджей карточек. Возвращает id задач с неполными моделями. */
+  function renderChecklistBadges() {
+    const incompleteIds = [];
+    for (const { badge, children } of checklistBadges()) {
+      const uniqueAssignees = [];
+      const seen = new Set();
+      for (const task of children) {
+        watchTaskChanges(task);
+        const assignee = currentAssignee(task);
+        if (assignee && !avatarUrl(assignee)) {
+          incompleteIds.push(task.id());
+        } else if (assignee) {
+          const key = assignee.uniqueName || assignee.displayName || assignee;
+          if (!seen.has(key)) {
+            seen.add(key);
+            uniqueAssignees.push(assignee);
+          }
+        }
+      }
+      showBadgeAvatars(badge, uniqueAssignees);
+    }
+    return incompleteIds;
   }
 
   /**
@@ -93,6 +158,49 @@
     return [...document.querySelectorAll(CHECKLIST_ROW)]
       .map(row => ({ row, task: ko.dataFor(row)?.item }))
       .filter(({ task }) => task && task.id() > 0);
+  }
+
+  /**
+   * Бейджи чеклистов на карточках доски (Task / Bug) вместе со списком дочерних задач.
+   * Модель карточки TFS доступна через $.data('tfsEnhancements')[0]._item.
+   * @returns {{ badge: HTMLElement, children: object[] }[]}
+   */
+  function checklistBadges() {
+    let $;
+    try { $ = window.jQuery || window.$ || window.require('jquery'); } catch { return []; }
+    if (!$) return [];
+
+    const results = [];
+    for (const card of document.querySelectorAll('.board-tile')) {
+      const children = $(card).data('tfsEnhancements')?.[0]?._item?.children?.();
+      if (!children?.length) continue;
+
+      for (const badge of card.querySelectorAll('.checklist-badge')) {
+        const summary = badge.querySelector('.child-work-items-summary');
+        if (!summary) continue;
+
+        const iconType = summary.querySelector('.work-item-type-icon')?.getAttribute('aria-label');
+        const matching = iconType
+          ? children.filter(c => (typeof c.type === 'function' ? c.type() : c.type) === iconType)
+          : children;
+
+        if (matching.length) results.push({ badge, children: matching });
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Все известные задачи (из раскрытых строк и из свернутых карточек).
+   * @returns {Map<number, object>} id -> модель задачи
+   */
+  function allKnownTasks() {
+    const map = new Map();
+    for (const { task } of checklistRows()) map.set(task.id(), task);
+    for (const { children } of checklistBadges()) {
+      for (const ch of children) map.set(ch.id(), ch);
+    }
+    return map;
   }
 
   /** Исполнитель задачи: с сервера, если модели доверять нельзя, иначе из модели. */
@@ -135,8 +243,9 @@
    * В displayName TFS логин обычно уже есть в скобках — тогда полный логин с доменом не дублируется.
    */
   function assigneeLabel(assignee) {
-    const name = assignee.displayName || '';
-    const login = assignee.uniqueName || '';
+    if (typeof assignee === 'string') return assignee;
+    const name = assignee?.displayName || '';
+    const login = assignee?.uniqueName || '';
     const shortLogin = login.split('\\').pop();
     return !login || name.includes(shortLogin) ? name : `${name} (${login})`;
   }
@@ -155,8 +264,9 @@
    * @returns {string|null} null — в identity нет данных для картинки (неполная модель).
    */
   function avatarUrl(assignee) {
-    if (assignee?.descriptor) return `${collectionUrl()}/_apis/GraphProfile/MemberAvatars/${assignee.descriptor}`;
-    return assignee?.imageUrl || assignee?._links?.avatar?.href || null;
+    if (!assignee || typeof assignee !== 'object') return null;
+    if (assignee.descriptor) return `${collectionUrl()}/_apis/GraphProfile/MemberAvatars/${assignee.descriptor}`;
+    return assignee.imageUrl || assignee._links?.avatar?.href || null;
   }
 
   /** Адрес коллекции TFS из текущего URL, например "/IS-Builder8". */
@@ -176,15 +286,53 @@
       row.classList.remove(ROW_WITH_AVATAR_CLASS);
       return;
     }
+    const url = avatarUrl(assignee);
     if (!img) {
       img = document.createElement('img');
       img.className = AVATAR_CLASS;
+      if (url) img.src = url;
+      img.title = img.alt = assignee.displayName || '';
       row.insertBefore(img, row.querySelector(ROW_TITLE));
       row.classList.add(ROW_WITH_AVATAR_CLASS);
+      return;
     }
-    const url = avatarUrl(assignee);
     if (img.getAttribute('src') !== url) img.src = url;
-    img.title = img.alt = assignee.displayName;
+    img.title = img.alt = assignee.displayName || '';
+  }
+
+  /**
+   * Отображает аватарки исполнителей рядом со счетчиком свернутого бейджа чеклиста (Task / Bug).
+   * @param {HTMLElement} badge контейнер бейджа .checklist-badge
+   * @param {object[]} assignees список уникальных исполнителей
+   */
+  function showBadgeAvatars(badge, assignees) {
+    let container = badge.querySelector(`:scope > .${BADGE_AVATARS_CLASS}`);
+    if (!assignees?.length) {
+      container?.remove();
+      return;
+    }
+    if (!container) {
+      container = document.createElement('span');
+      container.className = BADGE_AVATARS_CLASS;
+      badge.appendChild(container);
+    }
+
+    const urls = assignees.map(avatarUrl).filter(Boolean);
+    const currentUrls = [...container.children].map(img => img.getAttribute('src'));
+    if (urls.length === currentUrls.length && urls.every((u, i) => u === currentUrls[i])) return;
+
+    container.replaceChildren();
+    for (const assignee of assignees) {
+      const url = avatarUrl(assignee);
+      if (!url) continue;
+
+      const img = document.createElement('img');
+      img.className = BADGE_AVATAR_CLASS;
+      img.src = url;
+      img.title = assigneeLabel(assignee);
+      img.alt = assignee.displayName || '';
+      container.appendChild(img);
+    }
   }
 
   /**
@@ -203,9 +351,11 @@
     };
   }
 
-  /** Сверяет с сервером исполнителей всех задач в раскрытых чеклистах. Только на видимой вкладке. */
+  /** Сверяет с сервером исполнителей всех видимых задач. Только на активной вкладке. */
   function syncAllWithServer() {
-    if (!document.hidden) syncWithServer(checklistRows().map(({ task }) => task.id()));
+    if (document.hidden) return;
+    const ids = [...allKnownTasks().keys()];
+    if (ids.length) syncWithServer(ids);
   }
 
   /**
@@ -218,7 +368,8 @@
     if (!ids.length) return;
     ids.forEach(id => requestedIds.add(id));
     try {
-      const modelAssignees = new Map(checklistRows().map(({ task }) => [task.id(), assigneeFromModel(task)]));
+      const known = allKnownTasks();
+      const modelAssignees = new Map([...known.entries()].map(([id, task]) => [id, assigneeFromModel(task)]));
       for (let i = 0; i < ids.length; i += MAX_IDS_PER_REQUEST) {
         const fetched = await fetchAssignees(ids.slice(i, i + MAX_IDS_PER_REQUEST));
         for (const [id, fromServer] of fetched) {
@@ -249,6 +400,6 @@
     const response = await fetch(url).then(r => r.json());
     return new Map((response.value || [])
       .filter(Boolean)   // errorPolicy=omit: удалённые и недоступные задачи приходят как null
-      .map(w => [w.id, w.fields['System.AssignedTo'] || null]));
+      .map(w => [w.id, w.fields?.['System.AssignedTo'] || null]));
   }
 })();

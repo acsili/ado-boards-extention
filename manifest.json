@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ADO board: аватарки в чеклисте",
-  "version": "1.4",
-  "description": "Показывает аватар исполнителя у задач в чеклисте карточек доски TFS.",
+  "version": "1.5",
+  "description": "Показывает аватары исполнителей в чеклистах и на карточках доски TFS.",
   "content_scripts": [
     {
       "matches": ["https://rxtfs.directum.ru/*"],
